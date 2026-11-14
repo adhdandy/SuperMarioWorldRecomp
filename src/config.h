@@ -60,6 +60,10 @@ typedef struct Config {
   // adaptive renderer mod; these fields no longer configure PPU expansion.
   uint8 widescreen_mode;
   bool widescreen_hud;
+
+  // Render-side motion interpolation for high-refresh displays
+  // (SmwMotionMode; see src/smw_interp.c). Off = untouched stock path.
+  uint8 motion_interp;
   bool display_perf_title;
 
   // Skip the per-frame SDL_Delay pacing. Off by default (pacing on) so SPC +

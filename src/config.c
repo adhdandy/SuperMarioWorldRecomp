@@ -5,6 +5,7 @@
 #include <string.h>
 #include "desktop/sdl_compat.h"
 #include "util.h"
+#include "smw_interp.h"
 
 enum {
   kKeyMod_ScanCode = 0x200,
@@ -397,6 +398,8 @@ static bool HandleIniConfig(int section, const char *key, char *value) {
       return ParseWidescreenMode(value, &g_config.widescreen_mode);
     } else if (StringEqualsNoCase(key, "WidescreenHud")) {
       return ParseBool(value, &g_config.widescreen_hud);
+    } else if (StringEqualsNoCase(key, "MotionInterp")) {
+      return SmwMotionMode_Parse(value, (SmwMotionMode *)&g_config.motion_interp);
     } else if (StringEqualsNoCase(key, "Shader")) {
       g_config.shader = *value ? value : NULL;
       return true;
@@ -500,6 +503,9 @@ void ParseConfigFile(const char *filename) {
   g_config.deadzone[1] = 30;
   /* Retained for old config/launcher ABI; adaptive HUD anchoring is automatic. */
   g_config.widescreen_hud = true;
+
+  /* 120 Hz+ motion interpolation is opt-in (Off = untouched stock path). */
+  g_config.motion_interp = kSmwMotion_Off;
 
   /* An empty identity intentionally triggers recomp-ui's first-entry name
    * prompt. Once chosen it is persisted as [General] NetplayPlayerName. */
@@ -659,6 +665,7 @@ void WriteConfigFile(const char *filename) {
     { "GamepadMap", "Deadzone" },
     { "GamepadMap", "DeadzoneP2" },
     { "GamepadMap", "KeyboardPlayers" },
+    { "Graphics", "MotionInterp" },
   };
   const int N = (int)countof(kvs);
   snprintf(kvs[0].val, sizeof(kvs[0].val), "%d", g_config.window_scale ? g_config.window_scale : 3);
@@ -677,6 +684,8 @@ void WriteConfigFile(const char *filename) {
   snprintf(kvs[12].val, sizeof(kvs[12].val), "%d", g_config.deadzone[1]);
   g_config.keyboard_players = (int8)(g_config.has_keyboard_controls & 3);
   snprintf(kvs[13].val, sizeof(kvs[13].val), "%u", g_config.has_keyboard_controls & 3);
+  snprintf(kvs[14].val, sizeof(kvs[14].val), "%s",
+           SmwMotionMode_Name((SmwMotionMode)g_config.motion_interp));
 
   /* Read the existing file (may be absent on a fresh extract). */
   char *data = NULL;
