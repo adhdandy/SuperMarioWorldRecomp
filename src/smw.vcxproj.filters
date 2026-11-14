@@ -76,6 +76,9 @@
     <ClCompile Include="config.c">
       <Filter>Common</Filter>
     </ClCompile>
+    <ClCompile Include="smw_interp.c">
+      <Filter>Smw</Filter>
+    </ClCompile>
     <ClCompile Include="coop_patch.c">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -103,6 +106,9 @@
       <Filter>Smw</Filter>
     </ClInclude>
     <ClInclude Include="smw_spc_player.h">
+      <Filter>Smw</Filter>
+    </ClInclude>
+    <ClInclude Include="smw_interp.h">
       <Filter>Smw</Filter>
     </ClInclude>
     <ClInclude Include="..\snesrecomp\runner\src\snes\apu.h">

@@ -134,6 +134,7 @@ set(SMW_RUNTIME_SOURCES
     src/foreign_controller.c
     src/mod_external_rom_compat.c
     src/main.c
+    src/smw_interp.c
     src/smw_replay.c
     src/mods/smw_diagnostics_plugin.c
     src/smw_netplay_lobby.c

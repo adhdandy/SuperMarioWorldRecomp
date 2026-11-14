@@ -321,6 +321,7 @@
     <ClCompile Include="..\snesrecomp\runner\src\audio_trace.c" />
     <ClCompile Include="..\snesrecomp\runner\src\ppu_dma_trace.c" />
     <ClCompile Include="config.c" />
+  <ClCompile Include="smw_interp.c" />
     <ClCompile Include="coop_patch.c">
       <ExcludedFromBuild Condition="'$(Configuration)'!='CoopProduction'">true</ExcludedFromBuild>
     </ClCompile>
@@ -411,6 +412,7 @@
     <ClInclude Include="..\snesrecomp\runner\src\common_cpu_infra.h" />
     <ClInclude Include="..\snesrecomp\runner\src\common_rtl.h" />
     <ClInclude Include="config.h" />
+  <ClInclude Include="smw_interp.h" />
     <ClInclude Include="consts.h" />
     <ClInclude Include="..\recomp\funcs.h" />
     <ClInclude Include="glsl_shader.h" />
