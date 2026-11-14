@@ -12,6 +12,7 @@
 #include "snes/interp_bridge.h"   /* faithful LLE of the $806B main loop */
 #include "mods/falcon/smw_falcon_presentation_runtime.h"
 #include "mods/coop/coop_presentation.h"
+#include "smw_interp.h"
 
 static bool g_did_reset, g_first_frame_done;
 uint32_t SmwFrameDriverDiagnosticState(void) {
@@ -51,6 +52,7 @@ void SmwDrawPpuFrame(void) {
   SmwRendererBeginHardwareRaster(g_ppu);
   for (int i = 0; i <= 224; i++) {
     SmwRendererCaptureLine(g_ppu, i);
+    SmwInterp_CaptureLine(g_ppu, i); /* read-only snapshot for 120 Hz+ presents */
     ppu_runLine(g_ppu, i);
     SimpleHdma_DoLine(&hdma_chans[0]);
     SimpleHdma_DoLine(&hdma_chans[1]);
@@ -74,6 +76,7 @@ void SmwDrawPpuFrame(void) {
     }
   }
   SmwRendererEndHardwareRaster();
+  SmwInterp_EndFrame();
 }
 
 #include "mods/coop/coop_simulation.h"
