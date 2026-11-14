@@ -172,6 +172,22 @@ set(SMW_RUNTIME_SOURCES
     ${SMW_OVERRIDE_SOURCES}
 )
 
+# MSVC + /Zc:inline drops unreferenced internal-linkage DATA, which silently
+# deletes the .CRT$XCU constructor pointers SNES_MOD_CONSTRUCTOR creates
+# (mod_runtime.h): the plugin never registers, the mod plan is rejected with
+# "The executable does not provide this trusted plugin", and a fresh build
+# refuses to boot with any default-enabled mod feature. Negate the flag for
+# the plugin TUs so their self-registration survives.
+if(MSVC)
+    set_source_files_properties(
+        src/mods/smw_widescreen_plugin.c
+        src/mods/smw_msu1_plugin.c
+        src/mods/smw_coop_plugin.c
+        src/mods/smw_falcon_plugin.c
+        src/mods/smw_diagnostics_plugin.c
+        PROPERTIES COMPILE_OPTIONS "/Zc:inline-")
+endif()
+
 # Newer framework checkouts provide this shared helper. Retain compatibility
 # with the game's older submodule pin without linking both implementations.
 if(NOT EXISTS "${SNESRECOMP_ROOT}/runner/src/mod_audio.c")
