@@ -71,6 +71,7 @@
 #endif
 #endif
 #include "keybinds.h"
+#include "smw_interp.h"
 #include "host_report.h"
 #include "audio_trace.h"
 
@@ -940,6 +941,185 @@ static const struct RendererFuncs kSdlRendererFuncs = {
   &SdlRenderer_EndDraw,
 };
 
+/* ---- 120 Hz+ motion interpolation presenter (src/smw_interp.c) -----------
+ * The simulation keeps ticking at 60 Hz: one RtlRunFrame plus one live PPU
+ * raster per tick (HDMA and the raster IRQ included, exactly as the stock
+ * path). Presents are then clocked by the display instead of a fixed count:
+ * each EndDraw blocks until the next refresh, so emitting presents in a
+ * loop yields exactly one frame per display refresh, rendered at the
+ * elapsed fraction alpha = (now - tick_start) / tick_period of the 60 Hz
+ * tick. That works for any refresh rate (60..240 Hz) with no beat against
+ * the sim; SRW1's round(refresh/60) subframe count instead beat at 170 Hz.
+ *
+ * Interpolate sweeps prev->cur (up to 1 tick of added latency);
+ * Extrapolate presents cur first, then projects it forward (low latency).
+ * Whenever a frame cannot be produced, the live frame is presented instead
+ * (scene cuts, forced blank, mode changes, first tick). See
+ * docs/motion-interp.md. */
+static uint8 g_smw_interp_live[256 * 4 * 224];
+static uint8 g_smw_interp_sub[256 * 4 * 224];
+static uint64_t g_smw_interp_interval;     /* EMA vsync->vsync, counts */
+static uint64_t g_smw_interp_raster_cost;  /* EMA subframe raster cost */
+static uint64_t g_smw_interp_presents_total;
+static uint32_t g_smw_interp_ticks;
+
+static double SmwInterpDisplayHz(void) {
+  if (!g_window) return 0;
+#if SNESRECOMP_SDL3
+  const SDL_DisplayMode *dm =
+      SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(g_window));
+  return dm ? dm->refresh_rate : 0;
+#else
+  SDL_DisplayMode dm;
+  return SDL_GetCurrentDisplayMode(SDL_GetWindowDisplayIndex(g_window), &dm) == 0
+             ? dm.refresh_rate : 0;
+#endif
+}
+
+/* Presents one 256x224 XRGB frame (1024-byte rows). Returns the counter
+ * right after EndDraw; with vsync on that is effectively a vblank time. */
+static uint64_t SmwInterpPresent(const uint8 *src) {
+  uint8 *pb = 0;
+  int pitch = 0;
+  g_renderer_funcs.BeginDraw(g_snes_width, g_snes_height, &pb, &pitch);
+  for (int y = 0; y < 224; y++)
+    memcpy(pb + (size_t)y * pitch, src + (size_t)y * 1024, 1024);
+  g_renderer_funcs.EndDraw();
+  return SDL_GetPerformanceCounter();
+}
+
+static bool SmwInterpUsable(void) {
+  if (SmwInterp_GetMode() == kSmwMotion_Off) return false;
+  /* 256x224 only: the adaptive renderer owns any other frame geometry. */
+  if (g_snes_width != 256 || g_snes_height != 224) return false;
+  if (g_smw_video.enabled) return false;
+  /* The perf overlay is drawn into the presented buffer by the stock path. */
+  if (g_display_perf) return false;
+  /* Benchmarks run with vsync off: there is no display clock to pace. */
+  if (g_benchmark_frames > 0) return false;
+#if SNESRECOMP_NET
+  if (snes_netplay_active()) return false;  /* presents fight netplay pacing */
+#endif
+  /* Presents are paced by vsync; without it there is no display clock. */
+  static int s_vsync = -1;
+  if (s_vsync < 0) {
+    if (g_config.output_method == kOutputMethod_OpenGL)
+      s_vsync = 1;  /* SDL_GL_SetSwapInterval(1) requested at context creation */
+    else
+      s_vsync = snesrecomp_sdl_get_render_vsync(g_renderer) ? 1 : 0;
+  }
+  return s_vsync != 0;
+}
+
+static void SmwInterpDrawFrame(void) {
+  const uint64_t freq = SDL_GetPerformanceFrequency();
+  const uint64_t t_tick = SDL_GetPerformanceCounter();
+  const uint64_t period = freq / 60; /* nominal 60 Hz simulation tick */
+  const uint64_t deadline = t_tick + period;
+  const SmwMotionMode mode = SmwInterp_GetMode();
+  int presents = 0;
+
+  /* Live raster for this tick (also captures for the interpolator). */
+  RtlDrawPpuFrame(g_smw_interp_live, 1024, g_ppu_render_flags);
+  /* Match the WRAM dump's completed simulation frame, without pausing. */
+  const uint32 dump_frame = snes_frame_counter ? snes_frame_counter - 1 : 0;
+  FrameDump_Present(dump_frame, g_smw_interp_live, 1024, g_snes_width,
+                    g_snes_height);
+  FrameDump_Ppu(dump_frame, g_ppu);
+
+  /* Bootstrap the vsync interval from the display mode until two presents
+   * have been timed within a tick. Unknown rate => 60 Hz => no in-betweens
+   * fit, i.e. the feature stays inert rather than mispacing. */
+  if (!g_smw_interp_interval) {
+    double hz = SmwInterpDisplayHz();
+    if (hz >= 1.0) g_smw_interp_interval = (uint64_t)((double)freq / hz);
+  }
+  uint64_t prev_end = 0;
+
+  /* Extrapolate presents the newest tick first (f = 0..+1). Interpolate
+   * presents only the sweep toward it (f = -1..0) so on-screen motion stays
+   * monotonic: presenting the live frame first would jump one frame ahead
+   * and back every tick. */
+  if (mode == kSmwMotion_Extrapolate) {
+    prev_end = SmwInterpPresent(g_smw_interp_live);
+    presents++;
+  }
+
+  for (;;) {
+    if (!g_smw_interp_interval) break; /* unknown refresh: no in-betweens */
+    const uint64_t now = SDL_GetPerformanceCounter();
+    const uint64_t remaining = deadline > now ? deadline - now : 0;
+    /* Completion of one more present: the subframe raster finishes, then
+     * EndDraw blocks until the next vblank, i.e. (measured from the previous
+     * present's end) ceil(raster/interval) whole refresh intervals. With a
+     * raster faster than one refresh that is exactly one interval. A
+     * present that would complete after the 60 Hz deadline must never
+     * run, or the tick slips and SPC/MSU-1 audio drifts. */
+    uint64_t units =
+        (g_smw_interp_raster_cost + g_smw_interp_interval - 1) /
+        g_smw_interp_interval;
+    if (units == 0) units = 1;
+    const uint64_t est = units * g_smw_interp_interval;
+    if (presents >= 16 || remaining < est) break;
+    /* A present that did not block for ~a refresh means the compositor
+     * disabled vsync behind our back: degrade to one present per tick. */
+    if (g_smw_interp_interval < freq / 250) break;
+
+    /* Display time of this subframe: previous vblank + one interval (it is
+     * rendered now and shown at the next refresh). Fall back to the render
+     * instant until an interval has been measured. */
+    uint64_t shown_at = now;
+    if (prev_end && g_smw_interp_interval)
+      shown_at = prev_end + g_smw_interp_interval;
+    double alpha = (double)(shown_at - t_tick) / (double)period;
+    if (alpha < 0.0) alpha = 0.0;
+    if (alpha > 1.0) alpha = 1.0;
+    const float f = mode == kSmwMotion_Extrapolate ? (float)alpha
+                                                   : (float)alpha - 1.0f;
+
+    const uint64_t t0 = SDL_GetPerformanceCounter();
+    const bool rendered =
+        f != 0.0f && SmwInterp_RenderSubframe(f, g_smw_interp_sub);
+    const uint64_t t1 = SDL_GetPerformanceCounter();
+    g_smw_interp_raster_cost = g_smw_interp_raster_cost
+        ? g_smw_interp_raster_cost * 3 / 4 + (t1 - t0) / 4
+        : (t1 - t0);
+
+    const uint64_t end =
+        SmwInterpPresent(rendered ? g_smw_interp_sub : g_smw_interp_live);
+    presents++;
+    if (prev_end) {
+      const uint64_t interval = end - prev_end;
+      if (interval < freq / 4)  /* ignore suspend/resume glitches */
+        g_smw_interp_interval =
+            g_smw_interp_interval * 3 / 4 + interval / 4;
+    }
+    prev_end = end;
+  }
+
+  /* Interpolate with no room for in-betweens (e.g. a 60 Hz display): show
+   * the live frame directly, like the stock path. */
+  if (presents == 0) (void)SmwInterpPresent(g_smw_interp_live);
+
+  /* SMW_INTERP_DEBUG=1: one line per 60 ticks for pacing checks. */
+  g_smw_interp_ticks++;
+  g_smw_interp_presents_total += (uint32_t)presents;
+  static int s_debug = -1;
+  if (s_debug < 0) {
+    const char *e = getenv("SMW_INTERP_DEBUG");
+    s_debug = e && *e && e[0] != '0' ? 1 : 0;
+  }
+  if (s_debug && (g_smw_interp_ticks % 60) == 0) {
+    fprintf(stderr,
+            "[smw-interp] mode=%s interval=%.2fms raster=%.2fms "
+            "presents/tick=%.2f last=%d\n",
+            SmwMotionMode_Name(mode),
+            g_smw_interp_interval * 1000.0 / (double)freq,
+            g_smw_interp_raster_cost * 1000.0 / (double)freq,
+            (double)g_smw_interp_presents_total / (double)g_smw_interp_ticks,
+            presents);
+  }
+}
 
 void MkDir(const char *s) {
 #if defined(_WIN32)
@@ -1696,6 +1876,19 @@ int main(int argc, char** argv) {
     SetEnvVar("SNESRECOMP_MSU1", g_config.msu1_dir);
   }
 
+  /* 120 Hz+ motion interpolation: [Graphics] MotionInterp in config.ini,
+   * SMW_MOTION_INTERP env override for isolated QA runs. */
+  {
+    SmwMotionMode mode = (SmwMotionMode)g_config.motion_interp;
+    const char *env = getenv("SMW_MOTION_INTERP");
+    if (env && *env && !SmwMotionMode_Parse(env, &mode))
+      fprintf(stderr, "[smw-interp] ignoring unknown SMW_MOTION_INTERP=%s\n",
+              env);
+    SmwInterp_SetMode(mode);
+    if (mode != kSmwMotion_Off)
+      fprintf(stderr, "[smw-interp] mode=%s\n", SmwMotionMode_Name(mode));
+  }
+
   g_gamepad[0].joystick_id = g_gamepad[1].joystick_id = -1;
   g_snes_width = 256;
   g_snes_height = 224;
@@ -2348,7 +2541,10 @@ error_reading:;
     g_snes->disableRender = g_turbo && (frameCtr & 0xf) != 0;
 
     if (!g_snes->disableRender) {
-      DrawPpuFrameWithPerf();
+      if (SmwInterpUsable())
+        SmwInterpDrawFrame();
+      else
+        DrawPpuFrameWithPerf();
     } else {
       /* Turbo (render skipped): SmwDrawPpuFrame / draw_ppu_frame is NOT purely
        * cosmetic â€” it also simulates HDMA and fires the raster IRQ (I_IRQ).
@@ -3195,6 +3391,11 @@ static const char kDefaultConfigIniContent[] =
   "\n"
   "# Use the optimized SNES PPU implementation\n"
   "NewRenderer = 1\n"
+  "\n"
+  "# 120 Hz+ displays: render in-between frames from captured PPU state.\n"
+  "# off = untouched 60 Hz path; interpolate = smoothest (up to 1 frame of\n"
+  "# latency); extrapolate = low latency. Needs a vsync display clock.\n"
+  "MotionInterp = off\n"
   "\n"
   "# Don't keep the aspect ratio\n"
   "IgnoreAspectRatio = 0\n"
