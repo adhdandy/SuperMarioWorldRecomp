@@ -1,8 +1,9 @@
 # 120 Hz+ motion interpolation (render-side)
 
-**Status: Phase 1 (vanilla, 256-wide) implemented, awaiting build/test with
-the owner's ROM.** Origin: agent brief `smw-recomp-agent-brief.md`,
-Phase 0/1. See the brief for the phase gates.
+**Status: Phase 1 (vanilla, 256-wide) implemented and machine-verified on
+the target machine (2560x1440 @ 170 Hz).** Origin: agent brief
+`smw-recomp-agent-brief.md`, Phase 0/1. Scene-by-scene visual acceptance
+is the owner's (see checklist). See the brief for the phase gates.
 
 What this adds: high-refresh-display motion smoothness for the vanilla
 game. The simulation stays at 60 Hz; presentation gains in-between
@@ -92,15 +93,35 @@ Config: `[Graphics] MotionInterp = off|interpolate|extrapolate` (also
 * VRAM/OAM are captured whole-frame (at line 0), not per line — matches
   SRW1; mid-frame OAM rewrites are not interpolated.
 
-## Phase 1 acceptance checklist (pending ROM + owner visual test)
+## Phase 1 acceptance checklist
 
-- [ ] `Off`: bit-identical frames vs baseline (`FrameDump_*` +
-      `SNESRECOMP_FRAMEDUMP_PIXELS=1`), unchanged simulation.
-- [ ] Interpolate + Extrapolate visibly smooth at 120 and 170 Hz.
+Machine-verified (this machine, 2560x1440 @ 170 Hz, MSVC/CMake Release,
+`--benchmark 600` framedumps: BMP + WRAM + VRAM + CGRAM + PPU JSON per
+frame; `Temp/compare_baseline.py` compares all five artifacts):
+
+- [x] `Off`: **3000/3000 files byte-identical** vs stock `main` baseline
+      (600 frames x 5 artifacts). *(Verified 2026-11-15, feat/motion-interp
+      vs main @ ff4d20f.)*
+- [x] `Interpolate` with capture active: **3000/3000 byte-identical** vs
+      baseline in headless mode — the per-line capture hooks do not perturb
+      the simulation or the presented pixels.
+- [x] Presenter engages in windowed mode at 170 Hz: measured vsync
+      interval 5.8-5.9 ms (EMA), subframe raster 0.35-0.5 ms,
+      presents/tick 2.4-2.7 (ideal 170/60 = 2.83; the loop correctly
+      refuses presents that would miss the 60 Hz deadline). Both
+      interpolate and extrapolate modes. No beat: each present blocks one
+      refresh and alpha advances by the wall clock.
+- [ ] Interpolate + Extrapolate **visibly** smooth at 120 and 170 Hz
+      (owner's eyes — attract mode + gameplay).
 - [ ] Scene cuts, level transitions, blanked screens fall back live.
 - [ ] Scrolling levels, parallax, HDMA waves, status-bar split, Yoshi,
       sprite spawns, pause, overworld, title screen.
-- [ ] Audio stays in sync (pacing never slips a tick).
+- [ ] Audio stays in sync over a real play session (pacing never slips).
+
+Baseline/run configs: `build\Release\mods\preloaded\state.toml` with the
+widescreen feature `enabled = false` (vanilla 4:3; the interp gate excludes
+the adaptive renderer by design). QA env: `SMW_MOTION_INTERP`,
+`SMW_INTERP_DEBUG=1`.
 
 ## Phase 2+ hooks (for the wide-snes spike)
 
