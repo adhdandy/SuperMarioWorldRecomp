@@ -951,6 +951,21 @@ static const struct RendererFuncs kSdlRendererFuncs = {
  * tick. That works for any refresh rate (60..240 Hz) with no beat against
  * the sim; SRW1's round(refresh/60) subframe count instead beat at 170 Hz.
  *
+ * The tick budget starts at the TOP of the host frame, not here: the guest
+ * frame (RtlRunFrame) has already spent part of the 16.67 ms by the time the
+ * presenter runs, and spending a full period on presents afterwards made
+ * every tick 17-18 ms. The simulation then ran at 55-58 Hz, the SPC produced
+ * too few samples for the audio device, and music played slow and starved.
+ *
+ * The refresh estimate comes from the display mode, not from measured
+ * present gaps. Gaps are measured *inside* one tick, so one compositor or
+ * scheduler hitch (a level load, a page fault, a driver wait) enlarged the
+ * estimate above the tick period; every later tick then failed the "does
+ * this present fit?" test, and because a skipped present is never measured
+ * the estimate could never recover. Interpolation silently dropped to 60 Hz
+ * until restart. The display mode is the clock worth trusting; it is
+ * re-queried periodically so a mode change is still picked up.
+ *
  * Interpolate sweeps prev->cur (up to 1 tick of added latency);
  * Extrapolate presents cur first, then projects it forward (low latency).
  * Whenever a frame cannot be produced, the live frame is presented instead
@@ -958,7 +973,8 @@ static const struct RendererFuncs kSdlRendererFuncs = {
  * docs/motion-interp.md. */
 static uint8 g_smw_interp_live[256 * 4 * 224];
 static uint8 g_smw_interp_sub[256 * 4 * 224];
-static uint64_t g_smw_interp_interval;     /* EMA vsync->vsync, counts */
+static uint64_t g_smw_interp_interval;     /* display refresh interval, counts */
+static uint64_t g_smw_interp_vblank;       /* last observed vblank, counts */
 static uint64_t g_smw_interp_raster_cost;  /* EMA subframe raster cost */
 static uint64_t g_smw_interp_presents_total;
 static uint32_t g_smw_interp_ticks;
@@ -995,6 +1011,9 @@ static bool SmwInterpUsable(void) {
   if (g_smw_video.enabled) return false;
   /* The perf overlay is drawn into the presented buffer by the stock path. */
   if (g_display_perf) return false;
+  /* Fast-forward skips the outer frame pacing on purpose; capping it at the
+   * display rate would defeat turbo. */
+  if (g_turbo) return false;
   /* Benchmarks run with vsync off: there is no display clock to pace. */
   if (g_benchmark_frames > 0) return false;
 #if SNESRECOMP_NET
@@ -1011,11 +1030,32 @@ static bool SmwInterpUsable(void) {
   return s_vsync != 0;
 }
 
-static void SmwInterpDrawFrame(void) {
+/* Refresh the display-refresh estimate. The display mode is the clock worth
+ * trusting (see the block comment above the presenter state). */
+static void SmwInterpRefreshInterval(uint64_t freq) {
+  const double hz = SmwInterpDisplayHz();
+  if (hz >= 24.0 && hz <= 500.0)
+    g_smw_interp_interval = (uint64_t)((double)freq / hz);
+}
+
+/* Present one frame and, if the present actually waited for the compositor,
+ * remember the vblank it returned from. A free present was queued for a
+ * later vblank, so it must not move the grid. */
+static uint64_t SmwInterpPresentTracked(const uint8 *src) {
+  const uint64_t before = SDL_GetPerformanceCounter();
+  const uint64_t end = SmwInterpPresent(src);
+  if (g_smw_interp_interval && end - before >= g_smw_interp_interval / 2)
+    g_smw_interp_vblank = end;
+  return end;
+}
+
+/* frame_start: SDL_GetPerformanceCounter() at the TOP of the host frame,
+ * before RtlRunFrame. The tick's budget is one 60 Hz period from there: the
+ * guest frame has already spent part of it by the time the presenter runs. */
+static void SmwInterpDrawFrame(uint64_t frame_start) {
   const uint64_t freq = SDL_GetPerformanceFrequency();
-  const uint64_t t_tick = SDL_GetPerformanceCounter();
   const uint64_t period = freq / 60; /* nominal 60 Hz simulation tick */
-  const uint64_t deadline = t_tick + period;
+  const uint64_t deadline = frame_start + period;
   const SmwMotionMode mode = SmwInterp_GetMode();
   int presents = 0;
 
@@ -1027,51 +1067,57 @@ static void SmwInterpDrawFrame(void) {
                     g_snes_height);
   FrameDump_Ppu(dump_frame, g_ppu);
 
-  /* Bootstrap the vsync interval from the display mode until two presents
-   * have been timed within a tick. Unknown rate => 60 Hz => no in-betweens
+  /* Bootstrap the refresh interval from the display mode, then re-query it
+   * every ~2 s so a mode change is followed. Unknown rate => no in-betweens
    * fit, i.e. the feature stays inert rather than mispacing. */
-  if (!g_smw_interp_interval) {
-    double hz = SmwInterpDisplayHz();
-    if (hz >= 1.0) g_smw_interp_interval = (uint64_t)((double)freq / hz);
-  }
-  uint64_t prev_end = 0;
+  if (!g_smw_interp_interval || (g_smw_interp_ticks % 120) == 0)
+    SmwInterpRefreshInterval(freq);
 
   /* Extrapolate presents the newest tick first (f = 0..+1). Interpolate
    * presents only the sweep toward it (f = -1..0) so on-screen motion stays
    * monotonic: presenting the live frame first would jump one frame ahead
    * and back every tick. */
   if (mode == kSmwMotion_Extrapolate) {
-    prev_end = SmwInterpPresent(g_smw_interp_live);
+    (void)SmwInterpPresentTracked(g_smw_interp_live);
     presents++;
   }
 
   for (;;) {
     if (!g_smw_interp_interval) break; /* unknown refresh: no in-betweens */
-    const uint64_t now = SDL_GetPerformanceCounter();
-    const uint64_t remaining = deadline > now ? deadline - now : 0;
-    /* Completion of one more present: the subframe raster finishes, then
-     * EndDraw blocks until the next vblank, i.e. (measured from the previous
-     * present's end) ceil(raster/interval) whole refresh intervals. With a
-     * raster faster than one refresh that is exactly one interval. A
-     * present that would complete after the 60 Hz deadline must never
-     * run, or the tick slips and SPC/MSU-1 audio drifts. */
-    uint64_t units =
-        (g_smw_interp_raster_cost + g_smw_interp_interval - 1) /
-        g_smw_interp_interval;
-    if (units == 0) units = 1;
-    const uint64_t est = units * g_smw_interp_interval;
-    if (presents >= 16 || remaining < est) break;
-    /* A present that did not block for ~a refresh means the compositor
-     * disabled vsync behind our back: degrade to one present per tick. */
-    if (g_smw_interp_interval < freq / 250) break;
+    /* Four presents cover a 240 Hz panel; the cap also keeps a compositor
+     * that stops blocking from turning this into a burst. */
+    if (presents >= 4) break;
 
-    /* Display time of this subframe: previous vblank + one interval (it is
-     * rendered now and shown at the next refresh). Fall back to the render
-     * instant until an interval has been measured. */
-    uint64_t shown_at = now;
-    if (prev_end && g_smw_interp_interval)
-      shown_at = prev_end + g_smw_interp_interval;
-    double alpha = (double)(shown_at - t_tick) / (double)period;
+    /* Display time of this subframe = the vblank the present can catch.
+     * A present admitted now submits after one raster, and shows at the
+     * first vblank at or after that. The vblank grid is remembered from
+     * every present that actually blocked on it, so this is the real
+     * schedule rather than a worst-case "now + one interval": exact enough
+     * to fill nearly every refresh, and never early, so a present admitted
+     * here cannot finish after the 60 Hz deadline. That keeps the tick at
+     * 16.67 ms and the SPC feeding the device exactly 534 samples/frame.
+     * A slow raster isn't rejected separately: the projection below already
+     * pushes `shown_at` past the deadline in that case, and skipping the
+     * render would freeze the raster-cost estimate forever. */
+    const uint64_t now = SDL_GetPerformanceCounter();
+    if (now >= deadline) break;
+    const uint64_t submit = now + g_smw_interp_raster_cost;
+    uint64_t shown_at;
+    if (g_smw_interp_vblank) {
+      shown_at = g_smw_interp_vblank;
+      if (submit > shown_at) {
+        const uint64_t steps =
+            (submit - shown_at + g_smw_interp_interval - 1) /
+            g_smw_interp_interval;
+        shown_at += steps * g_smw_interp_interval;
+      }
+    } else {
+      /* No measured vblank yet (first presents): budget the worst case. */
+      shown_at = submit + g_smw_interp_interval;
+    }
+    if (shown_at > deadline) break;
+
+    double alpha = (double)(shown_at - frame_start) / (double)period;
     if (alpha < 0.0) alpha = 0.0;
     if (alpha > 1.0) alpha = 1.0;
     const float f = mode == kSmwMotion_Extrapolate ? (float)alpha
@@ -1085,21 +1131,18 @@ static void SmwInterpDrawFrame(void) {
         ? g_smw_interp_raster_cost * 3 / 4 + (t1 - t0) / 4
         : (t1 - t0);
 
-    const uint64_t end =
-        SmwInterpPresent(rendered ? g_smw_interp_sub : g_smw_interp_live);
+    (void)SmwInterpPresentTracked(rendered ? g_smw_interp_sub
+                                           : g_smw_interp_live);
     presents++;
-    if (prev_end) {
-      const uint64_t interval = end - prev_end;
-      if (interval < freq / 4)  /* ignore suspend/resume glitches */
-        g_smw_interp_interval =
-            g_smw_interp_interval * 3 / 4 + interval / 4;
-    }
-    prev_end = end;
+    /* No in-between available (scene cut, blanked screen, mode change): the
+     * live frame is already on screen, so further presents this tick would
+     * only repeat it. */
+    if (!rendered) break;
   }
 
   /* Interpolate with no room for in-betweens (e.g. a 60 Hz display): show
    * the live frame directly, like the stock path. */
-  if (presents == 0) (void)SmwInterpPresent(g_smw_interp_live);
+  if (presents == 0) (void)SmwInterpPresentTracked(g_smw_interp_live);
 
   /* SMW_INTERP_DEBUG=1: one line per 60 ticks for pacing checks. */
   g_smw_interp_ticks++;
@@ -1110,14 +1153,30 @@ static void SmwInterpDrawFrame(void) {
     s_debug = e && *e && e[0] != '0' ? 1 : 0;
   }
   if (s_debug && (g_smw_interp_ticks % 60) == 0) {
+    /* Pacing evidence: the tick rate the presenter actually sustained, plus
+     * APU-ring headroom and starvation counters. A tick slower than 60 Hz
+     * starves the device no matter how well each present was budgeted. */
+    static uint64_t s_win_start;
+    AudioTraceStats st;
+    audio_trace_get_stats(&st);
+    RtlApuLock();
+    const uint32_t ring = dsp_available(g_snes->apu->dsp);
+    RtlApuUnlock();
+    const double hz =
+        s_win_start ? 60.0 * (double)freq / (double)(frame_start - s_win_start)
+                    : 0.0;
+    s_win_start = frame_start;
     fprintf(stderr,
             "[smw-interp] mode=%s interval=%.2fms raster=%.2fms "
-            "presents/tick=%.2f last=%d\n",
+            "presents/tick=%.2f last=%d ticks_hz=%.3f ring=%u "
+            "underflows=%llu dropped=%llu\n",
             SmwMotionMode_Name(mode),
             g_smw_interp_interval * 1000.0 / (double)freq,
             g_smw_interp_raster_cost * 1000.0 / (double)freq,
             (double)g_smw_interp_presents_total / (double)g_smw_interp_ticks,
-            presents);
+            presents, hz, ring,
+            (unsigned long long)st.output_underflows,
+            (unsigned long long)st.dropped);
   }
 }
 
@@ -2542,7 +2601,7 @@ error_reading:;
 
     if (!g_snes->disableRender) {
       if (SmwInterpUsable())
-        SmwInterpDrawFrame();
+        SmwInterpDrawFrame(stall_t0);
       else
         DrawPpuFrameWithPerf();
     } else {
